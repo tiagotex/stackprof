@@ -30,6 +30,10 @@ if ARGV.first == "run"
     o.on('--ignore-gc', 'Ignore garbage collection frames') do |gc|
       env['STACKPROF_IGNORE_GC'] = gc.to_s
     end
+
+    o.on('--clean-io-wait-and-gc', 'Clean IO wait and garbage collection stacks') do |clean|
+      env['STACKPROF_CLEAN_IO_WAIT_AND_GC'] = clean.to_s
+    end
   end
   parser.parse!
   parser.abort(parser.help) if ARGV.empty?

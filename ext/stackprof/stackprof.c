@@ -101,6 +101,7 @@ static struct {
     VALUE out;
     VALUE metadata;
     int ignore_gc;
+    int clean_io_wait_and_gc;
 
     VALUE *raw_samples;
     size_t raw_samples_len;
@@ -135,7 +136,7 @@ static VALUE sym_object, sym_wall, sym_cpu, sym_custom, sym_name, sym_file, sym_
 static VALUE sym_samples, sym_total_samples, sym_missed_samples, sym_edges, sym_lines;
 static VALUE sym_version, sym_mode, sym_interval, sym_raw, sym_metadata, sym_frames, sym_ignore_gc, sym_out;
 static VALUE sym_aggregate, sym_raw_sample_timestamps, sym_raw_timestamp_deltas, sym_state, sym_marking, sym_sweeping;
-static VALUE sym_gc_samples, objtracer;
+static VALUE sym_gc_samples, objtracer, sym_clean_io_wait_and_gc;
 static VALUE gc_hook;
 static VALUE rb_mStackProf;
 
@@ -148,7 +149,7 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
     struct sigaction sa;
     struct itimerval timer;
     VALUE opts = Qnil, mode = Qnil, interval = Qnil, metadata = rb_hash_new(), out = Qfalse;
-    int ignore_gc = 0;
+    int ignore_gc = 0, clean_io_wait_and_gc = 0;
     int raw = 0, aggregate = 1;
     VALUE metadata_val;
 
@@ -165,7 +166,12 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
 	    ignore_gc = 1;
 	}
 
-	metadata_val = rb_hash_aref(opts, sym_metadata);
+    if (RTEST(rb_hash_aref(opts, sym_clean_io_wait_and_gc)))
+    {
+        clean_io_wait_and_gc = 1;
+    }
+
+    metadata_val = rb_hash_aref(opts, sym_metadata);
 	if (RTEST(metadata_val)) {
 	    if (!RB_TYPE_P(metadata_val, T_HASH))
 		rb_raise(rb_eArgError, "metadata should be a hash");
@@ -221,6 +227,7 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
     _stackprof.mode = mode;
     _stackprof.interval = interval;
     _stackprof.ignore_gc = ignore_gc;
+    _stackprof.clean_io_wait_and_gc = clean_io_wait_and_gc;
     _stackprof.metadata = metadata;
     _stackprof.out = out;
     _stackprof.target_thread = pthread_self();
@@ -411,6 +418,15 @@ stackprof_results(int argc, VALUE *argv, VALUE self)
 	_stackprof.raw = 0;
     }
 
+    if (_stackprof.clean_io_wait_and_gc) {
+        results = stackprof_cleanup_io_wait_and_gc_stacks(1, *{results}, self)
+
+        // VALUE rb_cStackProfReport = rb_define_class_under(rb_mStackProf, "Report", rb_cObject);
+        // VALUE args[1] = {results};
+        // VALUE report = rb_class_new_instance(1, *{results}, rb_cStackProfReport);
+        // results = rb_funcall(report, rb_intern("cleanup_io_wait_and_gc_stacks"), 0);
+    }
+
     if (argc == 1)
 	_stackprof.out = argv[0];
 
@@ -429,6 +445,224 @@ stackprof_results(int argc, VALUE *argv, VALUE self)
     } else {
 	return results;
     }
+}
+GC_FRAME_ID    = 1 # This is static as defined in ext/stackprof/stackprof.c
+IO_FRAME_NAMES = ["Puma::Single#run", "Puma::Cluster::Worker#run"].freeze
+
+// def cleanup_io_wait_and_gc_stacks(result)
+//   raw            = result[:raw]
+//   frames         = result[:frames]
+//   updated_raw    = []
+//   previous_stack = nil
+//   current_stack  = nil
+
+//   return result if raw.nil? || frames.nil?
+
+//   # Currently we are only supporting transforming puma IO wait
+//   io_wait_frame_id      = frames.find { |_key, frame| IO_FRAME_NAMES.include?(frame[:name]) }&.fetch(0)
+//   io_wait_root_frame_id = nil
+
+//   index = 0
+//   while (current_stack_height = raw[index])
+//     index += 1
+
+//     # We first get current_stack including the current stack number of samples and pop it out leaving only the stack
+//     # in current_stack
+//     current_stack               = raw.slice(index, current_stack_height + 1)
+//     current_stack_samples_count = current_stack.pop
+
+//     # Leave index at the start of the next stack
+//     index += current_stack_height + 1
+
+//     # First iteration we just push the current stack
+//     if previous_stack.nil?
+//       updated_raw += [current_stack_height, *current_stack, current_stack_samples_count]
+
+//       previous_stack = current_stack
+//       next
+//     end
+
+//     # When we know puma io wait frame exists we can check if current stack last frame is the io wait frame
+//     if io_wait_frame_id && current_stack[-1] == io_wait_frame_id
+//       # Update previous stack sample count if previous stack is io wait
+//       if previous_stack[-1] == io_wait_root_frame_id
+//         updated_raw[-1] += current_stack_samples_count
+//         next
+//       end
+
+//       # First time we encounter io wait we need to update the frame name so it is displayed correctly in the UI
+//       if io_wait_root_frame_id.nil?
+//         io_wait_root_frame_id = current_stack[0]
+
+//         frames[current_stack[0]] = frames[current_stack[0]].merge(name: "(io wait)", file: nil)
+//       end
+
+//       # When previous stack is gc we need to remove the gc frames from the previous stack before appending
+//       if (previous_stack_gc_frame_index = previous_stack.find_index(GC_FRAME_ID))
+//         new_stack = previous_stack[0..previous_stack_gc_frame_index - 1] + [current_stack[0]]
+//         updated_raw.push(new_stack.length, *new_stack, current_stack_samples_count)
+
+//         previous_stack = new_stack
+//         next
+//       end
+
+//       # Otherwise we just append the current stack to the previous stack
+//       new_stack = previous_stack + [current_stack[0]]
+//       updated_raw.push(previous_stack.length + 1, *new_stack, current_stack_samples_count)
+
+//       previous_stack = new_stack
+//       next
+//     end
+
+//     # If current stack is not GC we don't need to do anything and just return the current stack
+//     if current_stack[0] != GC_FRAME_ID
+//       updated_raw.push(current_stack_height, *current_stack, current_stack_samples_count)
+
+//       previous_stack = current_stack
+//       next
+//     end
+
+//     previous_stack_gc_frame_index = previous_stack.find_index(GC_FRAME_ID)
+
+//     # If the previous stack doesn't have GC we can append the current stack to the previous stack
+//     if previous_stack_gc_frame_index.nil?
+//       # When previous stack is io wait we need to remove the io wait frame from the previous stack before appending
+//       if previous_stack[-1] == io_wait_root_frame_id
+//         new_stack = previous_stack[0..-2] + current_stack
+//         updated_raw.push(new_stack.length, *new_stack, current_stack_samples_count)
+
+//         previous_stack = new_stack
+//         next
+//       end
+
+//       # Otherwise we just append the current stack to the previous stack
+//       new_stack = previous_stack + current_stack
+//       updated_raw.push(previous_stack.length + current_stack_height, *new_stack, current_stack_samples_count)
+
+//       previous_stack = new_stack
+//       next
+//     end
+
+//     # If the previous gc frames are the same as the current gc frames (Array of frame IDs are the same) we update the
+//     # previous stack by adding the current stack number of samples
+//     if previous_stack[previous_stack_gc_frame_index..] == current_stack
+//       updated_raw[-1] += current_stack_samples_count
+//     else
+//       # Otherwise we find the previous stack frame before the GC frame and append the current stack to it
+//       new_stack = previous_stack[0..previous_stack_gc_frame_index - 1] + current_stack
+//       updated_raw.push(new_stack.length, *new_stack, current_stack_samples_count)
+//     end
+//   end
+
+//   result[:raw] = updated_raw
+//   result
+// end
+// Convert the function to C using Ruby APIs
+
+static VALUE
+stackprof_cleanup_io_wait_and_gc_stacks(int argc, VALUE *argv, VALUE self)
+{
+    VALUE result = stackprof_results(argc, argv, self);
+    VALUE raw = rb_hash_aref(result, ID2SYM(rb_intern("raw")));
+    VALUE frames = rb_hash_aref(result, ID2SYM(rb_intern("frames")));
+
+    if (NIL_P(raw) || NIL_P(frames)) {
+        return result;
+    }
+
+    VALUE current_stack = Qnil;
+    VALUE previous_stack = Qnil;
+    VALUE updated_raw = rb_ary_new();
+
+    for (long i = 0; i < RARRAY_LEN(raw);) {
+        long current_stack_height = NUM2LONG(rb_ary_entry(raw, i));
+        i++;
+
+        current_stack = rb_ary_subseq(raw, i, current_stack_height + 1);
+        VALUE current_stack_samples_count = rb_ary_pop(current_stack);
+        i += current_stack_height + 1;
+
+        if (NIL_P(previous_stack)) {
+            rb_ary_push(updated_raw, LONG2NUM(current_stack_height));
+            rb_ary_concat(updated_raw, current_stack);
+            rb_ary_push(updated_raw, current_stack_samples_count);
+
+            previous_stack = current_stack;
+            continue;
+        }
+
+        VALUE io_wait_frame_id = Qnil;
+        VALUE io_wait_root_frame_id = Qnil;
+
+        if (RTEST(io_wait_frame_id) && rb_equal(rb_ary_entry(current_stack, -1), io_wait_frame_id)) {
+            if (rb_equal(rb_ary_entry(previous_stack, -1), io_wait_root_frame_id)) {
+                rb_ary_store(updated_raw, -1, rb_funcall(rb_ary_entry(updated_raw, -1), rb_intern("+"), 1, current_stack_samples_count));
+                continue;
+            }
+
+            if (NIL_P(io_wait_root_frame_id)) {
+                io_wait_root_frame_id = rb_ary_entry(current_stack, 0);
+
+                VALUE frame = rb_hash_aref(frames, io_wait_root_frame_id);
+                rb_hash_aset(frame, ID2SYM(rb_intern("name")), rb_str_new_cstr("(io wait)"));
+                rb_hash_aset(frame, ID2SYM(rb_intern("file")), Qnil);
+            }
+
+            if (RTEST(rb_ary_index(previous_stack, GC_FRAME_ID))) {
+                VALUE new_stack = rb_ary_plus(rb_ary_subseq(previous_stack, 0, RARRAY_LEN(previous_stack) - 1), rb_ary_new_from_args(1, rb_ary_entry(current_stack, 0)));
+                rb_ary_push(updated
+                rb_ary_push(updated_raw, LONG2NUM(current_stack_height));
+                rb_ary_concat(updated_raw, current_stack);
+                rb_ary_push(updated_raw, current_stack_samples_count);
+
+                previous_stack = current_stack;
+                continue;
+            }
+        }
+
+        if (NIL_P(GC_FRAME_ID)) {
+            GC_FRAME_ID = rb_str_new_cstr("(gc)");
+        }
+
+        if (RTEST(rb_ary_index(current_stack, GC_FRAME_ID))) {
+            if (NIL_P(previous_stack_gc_frame_index)) {
+                if (rb_equal(rb_ary_entry(previous_stack, -1), io_wait_root_frame_id)) {
+                    VALUE new_stack = rb_ary_plus(rb_ary_subseq(previous_stack, 0, RARRAY_LEN(previous_stack) - 1), rb_ary_subseq(current_stack, 0, RARRAY_LEN(current_stack) - 1));
+                    rb_ary_push(updated_raw, LONG2NUM(RARRAY_LEN(new_stack)));
+                    rb_ary_concat(updated_raw, new_stack);
+                    rb_ary_push(updated_raw, current_stack_samples_count);
+
+                    previous_stack = new_stack;
+                    continue;
+                }
+
+                VALUE new_stack = rb_ary_plus(rb_ary_subseq(previous_stack, 0, RARRAY_LEN(previous_stack) - 1), current_stack);
+                rb_ary_push(updated_raw, LONG2NUM(RARRAY_LEN(new_stack)));
+                rb_ary_concat(updated_raw, new_stack);
+                rb_ary_push(updated_raw, current_stack_samples_count);
+
+                previous_stack = new_stack;
+                continue;
+            }
+
+            if (rb_equal(rb_ary_entry(previous_stack, previous_stack_gc_frame_index), rb_ary_entry(current_stack, 0))) {
+                rb_ary_store(updated_raw, -1, rb_funcall(rb_ary_entry(updated_raw, -1), rb_intern("+"), 1, current_stack_samples_count));
+            } else {
+                VALUE new_stack = rb_ary_plus(rb_ary_subseq(previous_stack, 0, previous_stack_gc_frame_index), current_stack);
+                rb_ary_push(updated_raw, LONG2NUM(RARRAY_LEN(new_stack)));
+                rb_ary_concat(updated_raw, new_stack);
+                rb_ary_push(updated_raw, current_stack_samples_count);
+            }
+        } else {
+            rb_ary_push(updated_raw, LONG2NUM(current_stack_height));
+            rb_ary_concat(updated_raw, current_stack);
+            rb_ary_push(updated_raw, current_stack_samples_count);
+        }
+
+        previous_stack = current_stack;
+    }
+
+    return updated_raw;
 }
 
 static VALUE
@@ -898,6 +1132,7 @@ Init_stackprof(void)
     S(out);
     S(metadata);
     S(ignore_gc);
+    S(clean_io_wait_and_gc);
     S(frames);
     S(aggregate);
     S(state);
